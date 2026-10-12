@@ -108,6 +108,9 @@ namespace BackgroundAutoClicker
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
         [DllImport("user32.dll")]
+        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -201,6 +204,12 @@ namespace BackgroundAutoClicker
         private List<AttributeSlot> attrSlots = new List<AttributeSlot>();
         private int listeningSlotIndex = -1;
 
+        // Auto-Next Frame settings
+        private bool autoNextFrame = true;
+        private Keys nextFrameKey = Keys.Oemplus; // '+' key
+        private int nextFrameDelay = 60; // ms
+        private bool isListeningNextKey = false;
+
         private System.Windows.Forms.Timer countdownTimer;
         private int countdownSeconds = 0;
         private int countdownSlotIndex = -1;
@@ -242,6 +251,12 @@ namespace BackgroundAutoClicker
         private RadioButton rbAttrPhysical;
         private RadioButton rbAttrPostMessage;
         private CheckBox chkRestoreCursor;
+
+        // Auto-Next Controls
+        private CheckBox chkAutoNextFrame;
+        private Button btnNextKey;
+        private NumericUpDown numNextDelay;
+        private Button btnTestNext;
 
         private Label[] lblSlotName = new Label[5];
         private Button[] btnSlotKey = new Button[5];
@@ -291,7 +306,7 @@ namespace BackgroundAutoClicker
         private void BuildUI()
         {
             this.Text = "Project ni Xyrad";
-            this.Size = new Size(730, 860);
+            this.Size = new Size(730, 890);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
@@ -307,7 +322,7 @@ namespace BackgroundAutoClicker
             this.Controls.Add(top);
 
             MakeLabel(top, "PROJECT NI XYRAD", 18, 8, new Font("Segoe UI", 14f, FontStyle.Bold), Color.FromArgb(137, 180, 250));
-            MakeLabel(top, "Background Hover Recorder  |  Dynamic Attributes & Visibility Clicker",
+            MakeLabel(top, "Background Hover Recorder  |  Dynamic Attributes & Auto-Next Frame",
                 20, 38, new Font("Segoe UI", 8.5f), Color.FromArgb(166, 173, 200));
 
             // Status Bar
@@ -339,13 +354,13 @@ namespace BackgroundAutoClicker
             // Panels for Tabs
             pnlHoverTab = new Panel();
             pnlHoverTab.Location = new Point(20, 168);
-            pnlHoverTab.Size = new Size(675, 640);
+            pnlHoverTab.Size = new Size(675, 665);
             pnlHoverTab.BackColor = Color.FromArgb(24, 24, 37);
             this.Controls.Add(pnlHoverTab);
 
             pnlAttrTab = new Panel();
             pnlAttrTab.Location = new Point(20, 168);
-            pnlAttrTab.Size = new Size(675, 640);
+            pnlAttrTab.Size = new Size(675, 665);
             pnlAttrTab.BackColor = Color.FromArgb(24, 24, 37);
             pnlAttrTab.Visible = false;
             this.Controls.Add(pnlAttrTab);
@@ -538,44 +553,92 @@ namespace BackgroundAutoClicker
         private void BuildAttrTab()
         {
             // Master Toggle & Mode Section
-            GroupBox gMaster = MakeGroup("1. Attributes Master Switch & Click Mode", 0, 0, 675, 120);
+            GroupBox gMaster = MakeGroup("1. Attributes Master Switch, Click Mode, & Auto-Next Frame", 0, 0, 675, 142);
             pnlAttrTab.Controls.Add(gMaster);
 
-            btnAttrMasterToggle = MakeBtn("", 15, 22, 645, 42, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
-            btnAttrMasterToggle.Font = new Font("Segoe UI", 11f, FontStyle.Bold);
+            btnAttrMasterToggle = MakeBtn("", 15, 20, 645, 38, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
+            btnAttrMasterToggle.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
             btnAttrMasterToggle.Click += delegate { ToggleAttributesMaster(); };
             gMaster.Controls.Add(btnAttrMasterToggle);
             UpdateMasterToggleUI();
 
             rbAttrPhysical = new RadioButton();
-            rbAttrPhysical.Text = "⚡ Instant Jump & Click (Physical)";
+            rbAttrPhysical.Text = "⚡ Instant Jump & Click";
             rbAttrPhysical.Checked = true;
-            rbAttrPhysical.Location = new Point(15, 75);
-            rbAttrPhysical.Size = new Size(230, 24);
+            rbAttrPhysical.Location = new Point(15, 66);
+            rbAttrPhysical.Size = new Size(180, 24);
             rbAttrPhysical.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             rbAttrPhysical.ForeColor = Color.FromArgb(166, 227, 161);
             rbAttrPhysical.CheckedChanged += delegate { SaveAttributesConfig(); };
             gMaster.Controls.Add(rbAttrPhysical);
 
             chkRestoreCursor = new CheckBox();
-            chkRestoreCursor.Text = "Auto-return cursor to work spot";
+            chkRestoreCursor.Text = "Auto-return cursor to canvas";
             chkRestoreCursor.Checked = true;
-            chkRestoreCursor.Location = new Point(250, 76);
-            chkRestoreCursor.Size = new Size(210, 22);
+            chkRestoreCursor.Location = new Point(200, 67);
+            chkRestoreCursor.Size = new Size(200, 22);
             chkRestoreCursor.ForeColor = Color.FromArgb(249, 226, 175);
             gMaster.Controls.Add(chkRestoreCursor);
 
             rbAttrPostMessage = new RadioButton();
             rbAttrPostMessage.Text = "🌟 Background (PostMessage)";
-            rbAttrPostMessage.Location = new Point(465, 75);
-            rbAttrPostMessage.Size = new Size(200, 24);
+            rbAttrPostMessage.Location = new Point(415, 66);
+            rbAttrPostMessage.Size = new Size(245, 24);
             rbAttrPostMessage.Font = new Font("Segoe UI", 9f);
             rbAttrPostMessage.ForeColor = Color.FromArgb(137, 180, 250);
             rbAttrPostMessage.CheckedChanged += delegate { SaveAttributesConfig(); };
             gMaster.Controls.Add(rbAttrPostMessage);
 
+            // Auto-Next Frame Row
+            Panel pnlNext = new Panel();
+            pnlNext.Location = new Point(15, 96);
+            pnlNext.Size = new Size(645, 36);
+            pnlNext.BackColor = Color.FromArgb(24, 24, 37);
+            gMaster.Controls.Add(pnlNext);
+
+            chkAutoNextFrame = new CheckBox();
+            chkAutoNextFrame.Text = "⏩ Auto-Next Frame human og click:";
+            chkAutoNextFrame.Checked = autoNextFrame;
+            chkAutoNextFrame.Location = new Point(8, 7);
+            chkAutoNextFrame.Size = new Size(250, 22);
+            chkAutoNextFrame.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            chkAutoNextFrame.ForeColor = Color.FromArgb(166, 227, 161);
+            chkAutoNextFrame.CheckedChanged += delegate
+            {
+                autoNextFrame = chkAutoNextFrame.Checked;
+                SaveAttributesConfig();
+            };
+            pnlNext.Controls.Add(chkAutoNextFrame);
+
+            btnNextKey = MakeBtn(string.Format("Next Key: {0}", FormatKeyName(nextFrameKey)),
+                262, 3, 105, 30, Color.FromArgb(49, 50, 68), Color.White);
+            btnNextKey.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            btnNextKey.Click += delegate { StartListeningNextKey(); };
+            pnlNext.Controls.Add(btnNextKey);
+
+            MakeLabel(pnlNext, "Delay:", 375, 9, this.Font, Color.FromArgb(186, 194, 222));
+            numNextDelay = MakeNumeric(pnlNext, 420, 7, 55, 10, 1000, nextFrameDelay, 10);
+            numNextDelay.ValueChanged += delegate
+            {
+                nextFrameDelay = (int)numNextDelay.Value;
+                SaveAttributesConfig();
+            };
+
+            MakeLabel(pnlNext, "ms", 480, 9, this.Font, Color.FromArgb(186, 194, 222));
+
+            btnTestNext = MakeBtn("Test [ + ]", 515, 3, 120, 30, Color.FromArgb(137, 180, 250), Color.FromArgb(24, 24, 37));
+            btnTestNext.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            btnTestNext.Click += delegate
+            {
+                SendNextFrameKey();
+                lblStatus.Text = string.Format("[ TEST NEXT ] Gi-padala ang key [{0}] para sa next frame!", FormatKeyName(nextFrameKey));
+                lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                Beep(1100, 60);
+            };
+            pnlNext.Controls.Add(btnTestNext);
+
             // Group 2: Visibility Slots
-            GroupBox gSlots = MakeGroup("2. Visibility Attribute Slots (Editable Hotkeys & Position Captures)", 0, 128, 675, 385);
+            GroupBox gSlots = MakeGroup("2. Visibility Attribute Slots (Editable Hotkeys & Position Captures)", 0, 150, 675, 385);
             pnlAttrTab.Controls.Add(gSlots);
 
             int startY = 25;
@@ -654,14 +717,14 @@ namespace BackgroundAutoClicker
 
             // Help info panel
             Panel pnlHelp = new Panel();
-            pnlHelp.Location = new Point(0, 520);
-            pnlHelp.Size = new Size(675, 105);
+            pnlHelp.Location = new Point(0, 545);
+            pnlHelp.Size = new Size(675, 110);
             pnlHelp.BackColor = Color.FromArgb(30, 30, 46);
             pnlAttrTab.Controls.Add(pnlHelp);
 
-            MakeLabel(pnlHelp, "💡 UNSAON PAG-GAMIT SA ATTRIBUTES:", 15, 8, new Font("Segoe UI", 9.5f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
-            MakeLabel(pnlHelp, "1. I-click ang \"Set Pos (3s)\" unya lihoka dayon imong mouse paingon sa radio button sulod sa 3 segundos.\r\n" +
-                               "2. Pindota ang \"[Key: X]\" button kung gusto nimo ilisan ang hotkey ngadto sa bisan unsa nga key.\r\n" +
+            MakeLabel(pnlHelp, "💡 UNSAON PAG-GAMIT SA AUTO-NEXT ATTRIBUTES:", 15, 8, new Font("Segoe UI", 9.5f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
+            MakeLabel(pnlHelp, "1. I-set una ang 5 ka posisyon gamit ang \"Set Pos (3s)\" button.\r\n" +
+                               "2. Pindota ang 1, 2, 3, 4, o 5: mo-click dayon sa radio button unya AUTO-NEXT dayon sa next frame gamit ang \"+\"!\r\n" +
                                "3. Pindota F7 bisan kanus-a para i-OFF o i-ON ang Attributes (kung naka-OFF, magamit nimo ang 1-5 sa lain!).",
                                15, 32, new Font("Segoe UI", 8.5f), Color.FromArgb(205, 214, 244));
         }
@@ -724,6 +787,13 @@ namespace BackgroundAutoClicker
                 listeningSlotIndex = -1;
                 RefreshSlotUI(prev);
             }
+            if (isListeningNextKey)
+            {
+                isListeningNextKey = false;
+                btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
+                btnNextKey.ForeColor = Color.White;
+            }
 
             listeningSlotIndex = slotIndex;
             btnSlotKey[slotIndex].Text = "[ Pindota Key... ]";
@@ -736,8 +806,69 @@ namespace BackgroundAutoClicker
             this.Focus();
         }
 
+        private void StartListeningNextKey()
+        {
+            if (isListeningNextKey)
+            {
+                isListeningNextKey = false;
+                btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
+                btnNextKey.ForeColor = Color.White;
+                lblStatus.Text = "[ READY ] Kanselado ang pag-ilis sa Next key.";
+                lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                return;
+            }
+
+            if (listeningSlotIndex != -1)
+            {
+                int prev = listeningSlotIndex;
+                listeningSlotIndex = -1;
+                RefreshSlotUI(prev);
+            }
+
+            isListeningNextKey = true;
+            btnNextKey.Text = "[ Pindota Key... ]";
+            btnNextKey.BackColor = Color.FromArgb(249, 226, 175);
+            btnNextKey.ForeColor = Color.FromArgb(24, 24, 37);
+
+            lblStatus.Text = "[ CHANGE NEXT KEY ] Pindota ang key para sa Next Frame (e.g. +, D, Right Arrow) - ESC para cancel";
+            lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+
+            this.Focus();
+        }
+
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
+            if (isListeningNextKey)
+            {
+                Keys k = keyData & Keys.KeyCode;
+                isListeningNextKey = false;
+
+                if (k != Keys.Escape)
+                {
+                    nextFrameKey = k;
+                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                    btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
+                    btnNextKey.ForeColor = Color.White;
+
+                    lblStatus.Text = string.Format("[ NEXT KEY NA-ILISAN ] Next Frame key na-set sa [{0}]!", FormatKeyName(nextFrameKey));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1200, 100);
+
+                    SaveAttributesConfig();
+                }
+                else
+                {
+                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                    btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
+                    btnNextKey.ForeColor = Color.White;
+                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang Next Key.";
+                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                }
+
+                return true;
+            }
+
             if (listeningSlotIndex != -1)
             {
                 Keys k = keyData & Keys.KeyCode;
@@ -850,6 +981,7 @@ namespace BackgroundAutoClicker
                 return;
             }
 
+            // 1. Perform click on attribute
             if (rbAttrPostMessage != null && rbAttrPostMessage.Checked)
             {
                 // Background Click via PostMessage
@@ -891,10 +1023,58 @@ namespace BackgroundAutoClicker
                 }
             }
 
-            lblStatus.Text = string.Format("[ CLICKED ] Attribute \"{0}\" na-click! (Key: {1})",
-                slot.Name, FormatKeyName(slot.Hotkey));
-            lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
-            Beep(1300, 60);
+            Beep(1300, 50);
+
+            // 2. Auto-Next Frame if enabled!
+            if (chkAutoNextFrame != null && chkAutoNextFrame.Checked)
+            {
+                int delay = numNextDelay != null ? (int)numNextDelay.Value : 60;
+                if (delay > 0) Thread.Sleep(delay);
+
+                SendNextFrameKey();
+
+                lblStatus.Text = string.Format("[ CLICKED + NEXT ] \"{0}\" na-click ➔ Auto-abante sa Next Frame [{1}]!",
+                    slot.Name, FormatKeyName(nextFrameKey));
+                lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+            }
+            else
+            {
+                lblStatus.Text = string.Format("[ CLICKED ] Attribute \"{0}\" na-click! (Key: {1})",
+                    slot.Name, FormatKeyName(slot.Hotkey));
+                lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+            }
+        }
+
+        private void SendNextFrameKey()
+        {
+            if (nextFrameKey == Keys.Oemplus)
+            {
+                // US layout: '+' is Shift + '='
+                keybd_event(0x10, 0, 0, UIntPtr.Zero); // Shift down
+                keybd_event(0xBB, 0, 0, UIntPtr.Zero); // '=' down
+                Thread.Sleep(10);
+                keybd_event(0xBB, 0, 2, UIntPtr.Zero); // '=' up
+                keybd_event(0x10, 0, 2, UIntPtr.Zero); // Shift up
+
+                // Also trigger VK_ADD (NumPad +) just in case web app listens for keyCode 107
+                keybd_event(0x6B, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(5);
+                keybd_event(0x6B, 0, 2, UIntPtr.Zero);
+            }
+            else if (nextFrameKey == Keys.Add)
+            {
+                // NumPad +
+                keybd_event(0x6B, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(10);
+                keybd_event(0x6B, 0, 2, UIntPtr.Zero);
+            }
+            else
+            {
+                byte vk = (byte)nextFrameKey;
+                keybd_event(vk, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(10);
+                keybd_event(vk, 0, 2, UIntPtr.Zero);
+            }
         }
 
         private void ClearSlot(int index)
@@ -994,6 +1174,10 @@ namespace BackgroundAutoClicker
                 case Keys.NumPad7: return "Num 7";
                 case Keys.NumPad8: return "Num 8";
                 case Keys.NumPad9: return "Num 9";
+                case Keys.Oemplus: return "+";
+                case Keys.Add: return "Num +";
+                case Keys.OemMinus: return "-";
+                case Keys.Subtract: return "Num -";
                 default: return k.ToString();
             }
         }
@@ -1006,6 +1190,9 @@ namespace BackgroundAutoClicker
                 lines.Add("Enabled=" + attributesEnabled.ToString());
                 lines.Add("Mode=" + ((rbAttrPhysical != null && rbAttrPhysical.Checked) ? "Physical" : "PostMessage"));
                 lines.Add("Restore=" + ((chkRestoreCursor != null && chkRestoreCursor.Checked) ? "True" : "False"));
+                lines.Add("AutoNext=" + ((chkAutoNextFrame != null && chkAutoNextFrame.Checked) ? "True" : "False"));
+                lines.Add("NextKey=" + ((int)nextFrameKey).ToString());
+                lines.Add("NextDelay=" + (numNextDelay != null ? ((int)numNextDelay.Value).ToString() : nextFrameDelay.ToString()));
 
                 for (int i = 0; i < attrSlots.Count; i++)
                 {
@@ -1047,6 +1234,29 @@ namespace BackgroundAutoClicker
                     {
                         bool rst;
                         if (bool.TryParse(val, out rst)) chkRestoreCursor.Checked = rst;
+                    }
+                    else if (key == "AutoNext")
+                    {
+                        bool an;
+                        if (bool.TryParse(val, out an))
+                        {
+                            autoNextFrame = an;
+                            if (chkAutoNextFrame != null) chkAutoNextFrame.Checked = an;
+                        }
+                    }
+                    else if (key == "NextKey")
+                    {
+                        int nk;
+                        if (int.TryParse(val, out nk)) nextFrameKey = (Keys)nk;
+                    }
+                    else if (key == "NextDelay")
+                    {
+                        int nd;
+                        if (int.TryParse(val, out nd))
+                        {
+                            nextFrameDelay = nd;
+                            if (numNextDelay != null) numNextDelay.Value = Math.Max(numNextDelay.Minimum, Math.Min(numNextDelay.Maximum, nd));
+                        }
                     }
                     else if (key.StartsWith("Slot"))
                     {
