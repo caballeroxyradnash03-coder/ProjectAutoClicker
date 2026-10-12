@@ -69,6 +69,20 @@ namespace BackgroundAutoClicker
         }
     }
 
+    public class CuboidActionSlot
+    {
+        public string Name;
+        public Keys Hotkey;
+        public int OffsetY; // Exact pixel offset Y below "..." button (auto-calculated)
+
+        public CuboidActionSlot(string name, Keys defaultKey, int offsetY)
+        {
+            Name = name;
+            Hotkey = defaultKey;
+            OffsetY = offsetY;
+        }
+    }
+
     public class MainForm : Form
     {
         #region Win32 API
@@ -106,6 +120,9 @@ namespace BackgroundAutoClicker
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll")]
+        public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
 
         [DllImport("user32.dll")]
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -180,11 +197,14 @@ namespace BackgroundAutoClicker
         private const int VK_ESCAPE  = 0x1B;
 
         private const int WM_HOTKEY = 0x0312;
-        private const int HOTKEY_RECORD      = 1;  // F8
-        private const int HOTKEY_PLAY        = 2;  // F6
-        private const int HOTKEY_CLEAR       = 3;  // F9
-        private const int HOTKEY_TOGGLE_ATTR = 4;  // F7 (Master switch for Attributes)
-        private const int HOTKEY_ATTR_BASE   = 100; // 100..104 for Slots 0..4
+        private const int HOTKEY_RECORD         = 1;  // F8
+        private const int HOTKEY_PLAY           = 2;  // F6
+        private const int HOTKEY_CLEAR          = 3;  // F9
+        private const int HOTKEY_TOGGLE_ATTR    = 4;  // F7 (Master switch for Tab 2 Attributes)
+        private const int HOTKEY_TOGGLE_CUBOID  = 10; // F4 (Master switch for Tab 3 Cuboid actions)
+        private const int HOTKEY_CUBOID_SETUP   = 11; // X (Auto-setup cuboid)
+        private const int HOTKEY_ATTR_BASE      = 100; // 100..104 for Slots 0..4 (Tab 2)
+        private const int HOTKEY_CUBOID_BASE    = 200; // 200..203 for Cuboid actions 0..3 (Tab 3)
 
         private const uint GA_ROOT = 2;
         #endregion
@@ -205,20 +225,39 @@ namespace BackgroundAutoClicker
         private System.Windows.Forms.Timer uiTimer;
         #endregion
 
-        #region Attributes State
+        #region Tab 2: Attributes State
         private bool attributesEnabled = true;
         private List<AttributeSlot> attrSlots = new List<AttributeSlot>();
         private int listeningSlotIndex = -1;
 
-        // Auto-Next Frame settings
         private bool autoNextFrame = true;
         private Keys nextFrameKey = Keys.Oemplus; // '+' key
         private int nextFrameDelay = 100; // ms
         private bool isListeningNextKey = false;
+        #endregion
 
+        #region Tab 3: Cuboid Automations State
+        private bool cuboidActionsEnabled = true;
+
+        // "..." 3-dots button — the ONLY position to set once
+        private Point dotsPos = new Point(0, 0);
+
+        // Auto-calculated pixel offset Y below "..." button for "Make dynamic"
+        private int makeDynamicOffsetY = 215; // 6th item in Remotasks menu
+
+        private Keys cuboidSetupKey = Keys.X;
+        private bool isListeningCuboidSetupKey = false;
+
+        // 4 Actions: Floor (+102px), CopyAttr (+134px), CopyMotion (+166px), Delete (+264px)
+        private List<CuboidActionSlot> cuboidActions = new List<CuboidActionSlot>();
+        private int listeningCuboidActionIndex = -1;
+        #endregion
+
+        #region Shared Countdown Timer State
         private System.Windows.Forms.Timer countdownTimer;
         private int countdownSeconds = 0;
-        private int countdownSlotIndex = -1;
+        private int countdownTargetType = 0; // 0: None, 1: AttrSlot, 2: DotsPos
+        private int countdownTargetIndex = -1;
 
         private string configPath;
         #endregion
@@ -226,11 +265,13 @@ namespace BackgroundAutoClicker
         #region UI Controls
         private Label lblStatus;
 
-        // Tab buttons & panels
+        // Tab Navigation
         private Button btnTabHover;
         private Button btnTabAttr;
+        private Button btnTabCuboid;
         private Panel pnlHoverTab;
         private Panel pnlAttrTab;
+        private Panel pnlCuboidTab;
 
         // Hover Tab Controls
         private Label lblTargetInfo;
@@ -258,7 +299,6 @@ namespace BackgroundAutoClicker
         private RadioButton rbAttrPostMessage;
         private CheckBox chkRestoreCursor;
 
-        // Auto-Next Controls
         private CheckBox chkAutoNextFrame;
         private Button btnNextKey;
         private NumericUpDown numNextDelay;
@@ -271,6 +311,21 @@ namespace BackgroundAutoClicker
         private Button[] btnSlotTest = new Button[5];
         private Button[] btnSlotClear = new Button[5];
         private Button[] btnQuickTest = new Button[5];
+
+        // Cuboid Tab Controls
+        private Button btnCuboidMasterToggle;
+
+        private Label lblDotsPos;
+        private Button btnSetDots;
+
+        private Button btnCuboidSetupKey;
+        private Button btnRunCuboidSetup;
+        private NumericUpDown numMakeDynamicIdx;
+
+        private Label[] lblCuboidActName = new Label[4];
+        private Button[] btnCuboidActKey = new Button[4];
+        private NumericUpDown[] numCuboidActIndex = new NumericUpDown[4];
+        private Button[] btnCuboidActTest = new Button[4];
         #endregion
 
         public MainForm()
@@ -284,6 +339,7 @@ namespace BackgroundAutoClicker
             if (screenH <= 0) screenH = 1080;
 
             InitAttributeSlots();
+            InitCuboidActionSlots();
             LoadAttributesConfig();
 
             BuildUI();
@@ -309,10 +365,22 @@ namespace BackgroundAutoClicker
             attrSlots.Add(new AttributeSlot("75% - 100%", Keys.D5));
         }
 
+        private void InitCuboidActionSlots()
+        {
+            cuboidActions.Clear();
+            // Dropdown menu items are automatically clicked relative to "..." button:
+            // X offset = -90 (centered in menu), Y offset below "..." button:
+            // 3=Set floor (+102px), 4=Copy attr (+134px), 5=Copy motion (+166px), 7=Delete (+264px)
+            cuboidActions.Add(new CuboidActionSlot("Set Floor to Bottom", Keys.D4, 102));
+            cuboidActions.Add(new CuboidActionSlot("Copy Attributes",     Keys.D2, 134));
+            cuboidActions.Add(new CuboidActionSlot("Copy Motion",         Keys.D1, 166));
+            cuboidActions.Add(new CuboidActionSlot("Delete Cuboid",       Keys.D3, 264));
+        }
+
         private void BuildUI()
         {
             this.Text = "Project ni Xyrad";
-            this.Size = new Size(730, 890);
+            this.Size = new Size(730, 895);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
@@ -328,7 +396,7 @@ namespace BackgroundAutoClicker
             this.Controls.Add(top);
 
             MakeLabel(top, "PROJECT NI XYRAD", 18, 8, new Font("Segoe UI", 14f, FontStyle.Bold), Color.FromArgb(137, 180, 250));
-            MakeLabel(top, "Background Hover Recorder  |  Dynamic Attributes & Auto-Next Frame",
+            MakeLabel(top, "Hover Recorder  |  Visibility Auto-Next  |  Cuboid Dynamic & Actions",
                 20, 38, new Font("Segoe UI", 8.5f), Color.FromArgb(166, 173, 200));
 
             // Status Bar
@@ -339,40 +407,61 @@ namespace BackgroundAutoClicker
             this.Controls.Add(pnlS);
 
             lblStatus = new Label();
-            lblStatus.Text = "[ READY ]  Pindota F8 para mag-record  |  F7 para i-toggle ang Attributes";
-            lblStatus.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+            lblStatus.Text = "[ READY ]  F8: Record  |  F7: Toggle Visibility  |  F4: Toggle Cuboid Actions";
+            lblStatus.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
             lblStatus.Location = new Point(10, 8);
             lblStatus.AutoSize = true;
             pnlS.Controls.Add(lblStatus);
 
-            // Tab Navigation Buttons
-            btnTabHover = MakeBtn("🖱️  1. Mouse Hover Recorder", 20, 120, 332, 40, Color.FromArgb(137, 180, 250), Color.FromArgb(24, 24, 37));
-            btnTabHover.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-            btnTabHover.Click += delegate { SwitchTab(true); };
+            // 3 Tab Navigation Buttons
+            int tabW = 221;
+            btnTabHover = MakeBtn("🖱️  1. Hover Recorder", 20, 120, tabW, 40, Color.FromArgb(137, 180, 250), Color.FromArgb(24, 24, 37));
+            btnTabHover.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+            btnTabHover.Click += delegate { SwitchTab(0); };
             this.Controls.Add(btnTabHover);
 
-            btnTabAttr = MakeBtn("🏷️  2. Dynamic Attributes & Visibility", 362, 120, 333, 40, Color.FromArgb(49, 50, 68), Color.FromArgb(205, 214, 244));
-            btnTabAttr.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-            btnTabAttr.Click += delegate { SwitchTab(false); };
+            btnTabAttr = MakeBtn("🏷️  2. Visibility (1-5)", 246, 120, tabW, 40, Color.FromArgb(49, 50, 68), Color.FromArgb(205, 214, 244));
+            btnTabAttr.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+            btnTabAttr.Click += delegate { SwitchTab(1); };
             this.Controls.Add(btnTabAttr);
+
+            btnTabCuboid = MakeBtn("📦  3. Cuboid Actions", 472, 120, tabW, 40, Color.FromArgb(49, 50, 68), Color.FromArgb(205, 214, 244));
+            btnTabCuboid.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+            btnTabCuboid.Click += delegate { SwitchTab(2); };
+            this.Controls.Add(btnTabCuboid);
+
+            Image bgImg = LoadBackgroundImage();
+            if (bgImg != null)
+            {
+                this.BackgroundImage = bgImg;
+                this.BackgroundImageLayout = ImageLayout.Stretch;
+            }
 
             // Panels for Tabs
             pnlHoverTab = new Panel();
             pnlHoverTab.Location = new Point(20, 168);
-            pnlHoverTab.Size = new Size(675, 665);
-            pnlHoverTab.BackColor = Color.FromArgb(24, 24, 37);
+            pnlHoverTab.Size = new Size(675, 675);
+            pnlHoverTab.BackColor = Color.Transparent;
             this.Controls.Add(pnlHoverTab);
 
             pnlAttrTab = new Panel();
             pnlAttrTab.Location = new Point(20, 168);
-            pnlAttrTab.Size = new Size(675, 665);
-            pnlAttrTab.BackColor = Color.FromArgb(24, 24, 37);
+            pnlAttrTab.Size = new Size(675, 675);
+            pnlAttrTab.BackColor = Color.Transparent;
             pnlAttrTab.Visible = false;
             this.Controls.Add(pnlAttrTab);
 
+            pnlCuboidTab = new Panel();
+            pnlCuboidTab.Location = new Point(20, 168);
+            pnlCuboidTab.Size = new Size(675, 675);
+            pnlCuboidTab.BackColor = Color.Transparent;
+            pnlCuboidTab.Visible = false;
+            this.Controls.Add(pnlCuboidTab);
+
             BuildHoverTab();
             BuildAttrTab();
+            BuildCuboidTab();
 
             this.FormClosing += delegate
             {
@@ -383,37 +472,33 @@ namespace BackgroundAutoClicker
             };
         }
 
-        private void SwitchTab(bool isHover)
+        private void SwitchTab(int tabIndex)
         {
-            pnlHoverTab.Visible = isHover;
-            pnlAttrTab.Visible = !isHover;
+            pnlHoverTab.Visible = (tabIndex == 0);
+            pnlAttrTab.Visible = (tabIndex == 1);
+            pnlCuboidTab.Visible = (tabIndex == 2);
 
-            if (isHover)
+            Button[] btns = new Button[] { btnTabHover, btnTabAttr, btnTabCuboid };
+            for (int i = 0; i < 3; i++)
             {
-                btnTabHover.BackColor = Color.FromArgb(137, 180, 250);
-                btnTabHover.ForeColor = Color.FromArgb(24, 24, 37);
-                btnTabHover.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-
-                btnTabAttr.BackColor = Color.FromArgb(49, 50, 68);
-                btnTabAttr.ForeColor = Color.FromArgb(205, 214, 244);
-                btnTabAttr.Font = new Font("Segoe UI", 10f, FontStyle.Regular);
-            }
-            else
-            {
-                btnTabAttr.BackColor = Color.FromArgb(137, 180, 250);
-                btnTabAttr.ForeColor = Color.FromArgb(24, 24, 37);
-                btnTabAttr.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-
-                btnTabHover.BackColor = Color.FromArgb(49, 50, 68);
-                btnTabHover.ForeColor = Color.FromArgb(205, 214, 244);
-                btnTabHover.Font = new Font("Segoe UI", 10f, FontStyle.Regular);
+                if (i == tabIndex)
+                {
+                    btns[i].BackColor = Color.FromArgb(137, 180, 250);
+                    btns[i].ForeColor = Color.FromArgb(24, 24, 37);
+                    btns[i].Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+                }
+                else
+                {
+                    btns[i].BackColor = Color.FromArgb(49, 50, 68);
+                    btns[i].ForeColor = Color.FromArgb(205, 214, 244);
+                    btns[i].Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+                }
             }
         }
 
         #region Hover Tab UI
         private void BuildHoverTab()
         {
-            // Group 1: Playback Mode
             GroupBox gMode = MakeGroup("1. Playback Mode (Pilia kung unsa imong gusto)", 0, 0, 675, 88);
             pnlHoverTab.Controls.Add(gMode);
 
@@ -434,7 +519,6 @@ namespace BackgroundAutoClicker
             rbPhysicalMode.Font = new Font("Segoe UI", 9f);
             gMode.Controls.Add(rbPhysicalMode);
 
-            // Group 2: Path Preview & Target Window
             GroupBox g2 = MakeGroup("2. Recorded Path Preview & Target Window", 0, 94, 675, 195);
             pnlHoverTab.Controls.Add(g2);
 
@@ -471,7 +555,6 @@ namespace BackgroundAutoClicker
             lblStats.AutoSize = true;
             g2.Controls.Add(lblStats);
 
-            // Group 3: Playback Settings
             GroupBox g3 = MakeGroup("3. Playback Settings", 0, 296, 675, 165);
             pnlHoverTab.Controls.Add(g3);
 
@@ -538,7 +621,6 @@ namespace BackgroundAutoClicker
             lblPlayStats.AutoSize = true;
             g3.Controls.Add(lblPlayStats);
 
-            // Big Play / Stop Button
             btnPlay = MakeBtn("PLAY RECORDED HOVER (F6)", 0, 470, 675, 52, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
             btnPlay.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
             btnPlay.Click += delegate { TogglePlayback(); };
@@ -555,10 +637,9 @@ namespace BackgroundAutoClicker
         }
         #endregion
 
-        #region Attributes Tab UI
+        #region Tab 2: Attributes UI
         private void BuildAttrTab()
         {
-            // Master Toggle & Mode Section
             GroupBox gMaster = MakeGroup("1. Attributes Master Switch, Click Mode, & Auto-Next Frame", 0, 0, 675, 142);
             pnlAttrTab.Controls.Add(gMaster);
 
@@ -595,7 +676,6 @@ namespace BackgroundAutoClicker
             rbAttrPostMessage.CheckedChanged += delegate { SaveAttributesConfig(); };
             gMaster.Controls.Add(rbAttrPostMessage);
 
-            // Auto-Next Frame Row
             Panel pnlNext = new Panel();
             pnlNext.Location = new Point(15, 96);
             pnlNext.Size = new Size(645, 36);
@@ -650,7 +730,6 @@ namespace BackgroundAutoClicker
             };
             pnlNext.Controls.Add(btnTestNext);
 
-            // Group 2: Visibility Slots
             GroupBox gSlots = MakeGroup("2. Visibility Attribute Slots (Editable Hotkeys & Position Captures)", 0, 150, 675, 385);
             pnlAttrTab.Controls.Add(gSlots);
 
@@ -662,7 +741,6 @@ namespace BackgroundAutoClicker
                 int idx = i;
                 int curY = startY + (i * stepY);
 
-                // Slot Label
                 lblSlotName[i] = new Label();
                 lblSlotName[i].Text = string.Format("{0}. {1}", i + 1, attrSlots[i].Name);
                 lblSlotName[i].Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
@@ -671,14 +749,12 @@ namespace BackgroundAutoClicker
                 lblSlotName[i].Size = new Size(125, 24);
                 gSlots.Controls.Add(lblSlotName[i]);
 
-                // Editable Key Button
                 btnSlotKey[i] = MakeBtn(string.Format("Key: {0}", FormatKeyName(attrSlots[i].Hotkey)),
                     145, curY, 95, 30, Color.FromArgb(49, 50, 68), Color.White);
                 btnSlotKey[i].Font = new Font("Segoe UI", 9f, FontStyle.Bold);
                 btnSlotKey[i].Click += delegate { StartListeningKey(idx); };
                 gSlots.Controls.Add(btnSlotKey[i]);
 
-                // Coordinates Label
                 lblSlotPos[i] = new Label();
                 lblSlotPos[i].Text = "[ Wala pa na-set ]";
                 lblSlotPos[i].Font = new Font("Segoe UI", 9f);
@@ -687,19 +763,16 @@ namespace BackgroundAutoClicker
                 lblSlotPos[i].Size = new Size(160, 22);
                 gSlots.Controls.Add(lblSlotPos[i]);
 
-                // Set Pos Button (3s countdown)
                 btnSlotSet[i] = MakeBtn("Set Pos (3s)", 415, curY, 105, 30, Color.FromArgb(243, 139, 168), Color.FromArgb(24, 24, 37));
                 btnSlotSet[i].Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-                btnSlotSet[i].Click += delegate { StartCountdown(idx); };
+                btnSlotSet[i].Click += delegate { StartCountdown(1, idx); };
                 gSlots.Controls.Add(btnSlotSet[i]);
 
-                // Test Click Button
                 btnSlotTest[i] = MakeBtn("Test", 528, curY, 62, 30, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
                 btnSlotTest[i].Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
                 btnSlotTest[i].Click += delegate { TriggerSlotClick(idx); };
                 gSlots.Controls.Add(btnSlotTest[i]);
 
-                // Clear Button
                 btnSlotClear[i] = MakeBtn("Clear", 596, curY, 62, 30, Color.FromArgb(69, 71, 90), Color.White);
                 btnSlotClear[i].Font = new Font("Segoe UI", 8.5f);
                 btnSlotClear[i].Click += delegate { ClearSlot(idx); };
@@ -708,7 +781,6 @@ namespace BackgroundAutoClicker
                 RefreshSlotUI(i);
             }
 
-            // Quick Test Buttons
             Label lblQuick = new Label();
             lblQuick.Text = "Quick Click Test Buttons (Walay hotkey kinahanglan, direct click):";
             lblQuick.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
@@ -728,7 +800,6 @@ namespace BackgroundAutoClicker
                 gSlots.Controls.Add(btnQuickTest[i]);
             }
 
-            // Help info panel
             Panel pnlHelp = new Panel();
             pnlHelp.Location = new Point(0, 545);
             pnlHelp.Size = new Size(675, 110);
@@ -737,13 +808,667 @@ namespace BackgroundAutoClicker
 
             MakeLabel(pnlHelp, "💡 UNSAON PAG-GAMIT SA AUTO-NEXT ATTRIBUTES:", 15, 8, new Font("Segoe UI", 9.5f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
             MakeLabel(pnlHelp, "1. I-set una ang 5 ka posisyon gamit ang \"Set Pos (3s)\" button.\r\n" +
-                               "2. Pindota ang 1, 2, 3, 4, o 5: mo-click dayon sa radio button unya AUTO-NEXT dayon sa next frame gamit ang \"+\"!\r\n" +
+                               "2. Pindota ang 1, 2, 3, 4, o 5: mo-click sa radio button unya AUTO-NEXT dayon sa next frame gamit ang \"+\"!\r\n" +
                                "3. Pindota F7 bisan kanus-a para i-OFF o i-ON ang Attributes (kung naka-OFF, magamit nimo ang 1-5 sa lain!).",
                                15, 32, new Font("Segoe UI", 8.5f), Color.FromArgb(205, 214, 244));
         }
         #endregion
 
-        #region Attributes Logic
+        #region Tab 3: Cuboid Actions UI
+        private void BuildCuboidTab()
+        {
+            // ── Group 1: ONE-TIME SETUP (just the "..." dots button) ──────────────────
+            GroupBox gSetup = MakeGroup("1. One-Time Setup — \"...\" (3 Dots) Button Position", 0, 0, 675, 120);
+            pnlCuboidTab.Controls.Add(gSetup);
+
+            MakeLabel(gSetup, "\"...\" (3 Dots) Button:", 15, 26,
+                new Font("Segoe UI", 9.5f, FontStyle.Bold), Color.FromArgb(137, 180, 250));
+
+            lblDotsPos = MakeLabel(gSetup, FormatPoint(dotsPos), 185, 26, this.Font, Color.FromArgb(166, 227, 161));
+
+            btnSetDots = MakeBtn("📍 Set Pos (3s hover)", 380, 20, 160, 30,
+                Color.FromArgb(243, 139, 168), Color.FromArgb(24, 24, 37));
+            btnSetDots.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            btnSetDots.Click += delegate { StartCountdown(2, 0); };
+            gSetup.Controls.Add(btnSetDots);
+
+            Label lblDotsNote = new Label();
+            lblDotsNote.Text = "⚠️  I-set ni ISIG USAB LANG kung mag-lihok ang browser window. Isave na dayon sa config!";
+            lblDotsNote.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            lblDotsNote.ForeColor = Color.FromArgb(249, 226, 175);
+            lblDotsNote.Location = new Point(15, 60);
+            lblDotsNote.Size = new Size(645, 40);
+            gSetup.Controls.Add(lblDotsNote);
+
+            // ── Group 2: MAKE DYNAMIC + 100% DENSITY (Auto-Click!) ──
+            GroupBox gDyn = MakeGroup("2. Make Dynamic + 100% Density — 100% Automatic (Auto-Click from '...')", 0, 128, 675, 145);
+            pnlCuboidTab.Controls.Add(gDyn);
+
+            // Info row
+            Label lblDynInfo = new Label();
+            lblDynInfo.Text = "🤖  Automatic! I-click ang \"...\", unya automatic mo-click sa \"Make dynamic\" (+215px), unya Alt+J para sa Density.";
+            lblDynInfo.Font = new Font("Segoe UI", 8.5f);
+            lblDynInfo.ForeColor = Color.FromArgb(166, 227, 161);
+            lblDynInfo.Location = new Point(15, 20);
+            lblDynInfo.Size = new Size(645, 38);
+            gDyn.Controls.Add(lblDynInfo);
+
+            // Hotkey + Make Dynamic offset Y + Run button
+            MakeLabel(gDyn, "Hotkey:", 15, 68, new Font("Segoe UI", 9f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
+
+            btnCuboidSetupKey = MakeBtn(string.Format("Key: {0}", FormatKeyName(cuboidSetupKey)),
+                75, 63, 100, 30, Color.FromArgb(49, 50, 68), Color.White);
+            btnCuboidSetupKey.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            btnCuboidSetupKey.Click += delegate { StartListeningCuboidSetupKey(); };
+            gDyn.Controls.Add(btnCuboidSetupKey);
+
+            MakeLabel(gDyn, "Auto Y: +", 185, 68, new Font("Segoe UI", 9f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
+            numMakeDynamicIdx = MakeNumeric(gDyn, 255, 65, 55, 40, 500, makeDynamicOffsetY, 5);
+            numMakeDynamicIdx.ValueChanged += delegate
+            {
+                makeDynamicOffsetY = (int)numMakeDynamicIdx.Value;
+                SaveAttributesConfig();
+            };
+            MakeLabel(gDyn, "px", 315, 68, new Font("Segoe UI", 8.5f), Color.FromArgb(147, 153, 178));
+
+            btnRunCuboidSetup = MakeBtn("⚡ TEST RUN (Dynamic + Density)", 435, 63, 220, 30,
+                Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
+            btnRunCuboidSetup.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+            btnRunCuboidSetup.Click += delegate { ExecuteMakeDynamicAndDensity(); };
+            gDyn.Controls.Add(btnRunCuboidSetup);
+
+            Label lblDensityNote = new Label();
+            lblDensityNote.Text = "💡  Dili na kinahanglan i-set mano-mano! Ang distansya gikan sa \"...\" kay automatic na.";
+            lblDensityNote.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            lblDensityNote.ForeColor = Color.FromArgb(147, 153, 178);
+            lblDensityNote.Location = new Point(15, 102);
+            lblDensityNote.Size = new Size(645, 22);
+            gDyn.Controls.Add(lblDensityNote);
+
+            // ── Group 3: CUBOID ACTION HOTKEYS (Master ON/OFF) ───────────────────────
+            GroupBox gActs = MakeGroup("3. Cuboid Action Hotkeys — 100% Automatic Direct Click (F4 = Master ON/OFF)", 0, 280, 675, 310);
+            pnlCuboidTab.Controls.Add(gActs);
+
+            btnCuboidMasterToggle = MakeBtn("", 15, 20, 645, 38, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
+            btnCuboidMasterToggle.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+            btnCuboidMasterToggle.Click += delegate { ToggleCuboidMaster(); };
+            gActs.Controls.Add(btnCuboidMasterToggle);
+            UpdateCuboidMasterToggleUI();
+
+            MakeLabel(gActs, "Action",   15,  65, new Font("Segoe UI", 8.5f, FontStyle.Bold), Color.FromArgb(147, 153, 178));
+            MakeLabel(gActs, "Hotkey",  178,  65, new Font("Segoe UI", 8.5f, FontStyle.Bold), Color.FromArgb(147, 153, 178));
+            MakeLabel(gActs, "Auto Click Offset Y", 285, 65, new Font("Segoe UI", 8.5f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
+
+            int actStartY = 84;
+            int actStepY  = 50;
+
+            for (int i = 0; i < 4; i++)
+            {
+                int idx  = i;
+                int curY = actStartY + (i * actStepY);
+
+                lblCuboidActName[i] = new Label();
+                lblCuboidActName[i].Text      = cuboidActions[i].Name;
+                lblCuboidActName[i].Font      = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+                lblCuboidActName[i].ForeColor = Color.FromArgb(137, 180, 250);
+                lblCuboidActName[i].Location  = new Point(15, curY + 5);
+                lblCuboidActName[i].Size      = new Size(160, 26);
+                gActs.Controls.Add(lblCuboidActName[i]);
+
+                btnCuboidActKey[i] = MakeBtn(string.Format("Key: {0}", FormatKeyName(cuboidActions[i].Hotkey)),
+                    178, curY, 100, 30, Color.FromArgb(49, 50, 68), Color.White);
+                btnCuboidActKey[i].Font  = new Font("Segoe UI", 9f, FontStyle.Bold);
+                btnCuboidActKey[i].Click += delegate { StartListeningCuboidActionKey(idx); };
+                gActs.Controls.Add(btnCuboidActKey[i]);
+
+                MakeLabel(gActs, "+", 285, curY + 7, new Font("Segoe UI", 10f, FontStyle.Bold), Color.FromArgb(249, 226, 175));
+                numCuboidActIndex[i] = MakeNumeric(gActs, 302, curY + 3, 56, 40, 500, cuboidActions[i].OffsetY, 2);
+                numCuboidActIndex[i].ValueChanged += delegate
+                {
+                    cuboidActions[idx].OffsetY = (int)numCuboidActIndex[idx].Value;
+                    SaveAttributesConfig();
+                };
+                MakeLabel(gActs, "px (Auto-Click)", 364, curY + 7, new Font("Segoe UI", 8.5f), Color.FromArgb(166, 227, 161));
+
+                btnCuboidActTest[i] = MakeBtn("▶ Test", 565, curY, 90, 30, Color.FromArgb(166, 227, 161), Color.FromArgb(24, 24, 37));
+                btnCuboidActTest[i].Font  = new Font("Segoe UI", 9f, FontStyle.Bold);
+                btnCuboidActTest[i].Click += delegate { ExecuteCuboidAction(idx); };
+                gActs.Controls.Add(btnCuboidActTest[i]);
+            }
+        }
+        #endregion
+
+        #region Cuboid Automations Logic
+        private void ToggleCuboidMaster()
+        {
+            cuboidActionsEnabled = !cuboidActionsEnabled;
+            UpdateCuboidMasterToggleUI();
+
+            if (cuboidActionsEnabled)
+            {
+                RegisterCuboidHotkeys();
+                lblStatus.Text = "[ CUBOID ACTIONS: ACTIVE ] Naka-ON na ang hotkeys! Pindota F4 para i-OFF.";
+                lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                Beep(1400, 100);
+            }
+            else
+            {
+                UnregisterCuboidHotkeys();
+                lblStatus.Text = "[ CUBOID ACTIONS: OFF ] Naka-OFF na! Hotkeys released. Pindota F4 para i-ON.";
+                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+                Beep(700, 100);
+            }
+
+            SaveAttributesConfig();
+        }
+
+        private void UpdateCuboidMasterToggleUI()
+        {
+            if (cuboidActionsEnabled)
+            {
+                btnCuboidMasterToggle.Text = "🟢  CUBOID ACTIONS: ON  (Pindota F4 o i-click dinhi para i-OFF)";
+                btnCuboidMasterToggle.BackColor = Color.FromArgb(166, 227, 161);
+                btnCuboidMasterToggle.ForeColor = Color.FromArgb(24, 24, 37);
+            }
+            else
+            {
+                btnCuboidMasterToggle.Text = "🔴  CUBOID ACTIONS: OFF  (Hotkeys released | Pindota F4 o i-click para i-ON)";
+                btnCuboidMasterToggle.BackColor = Color.FromArgb(69, 71, 90);
+                btnCuboidMasterToggle.ForeColor = Color.FromArgb(205, 214, 244);
+            }
+        }
+
+        private void SimulatePhysicalClick(int x, int y)
+        {
+            SetCursorPos(x, y);
+            MovePhysicalMouse(x, y);
+            Thread.Sleep(30);
+
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            SendPhysicalClick(0, true);
+            Thread.Sleep(35);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+            SendPhysicalClick(0, false);
+            Thread.Sleep(50);
+        }
+
+        private void ExecuteMakeDynamicAndDensity()
+        {
+            if (dotsPos.X == 0 && dotsPos.Y == 0)
+            {
+                lblStatus.Text = "[ WALA PA NA-SET ] I-set una ang posisyon sa \"...\" (3 Dots) button!";
+                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+                Beep(400, 100);
+                return;
+            }
+
+            POINT origPt;
+            GetCursorPos(out origPt);
+
+            int dynOffY = (numMakeDynamicIdx != null) ? (int)numMakeDynamicIdx.Value : makeDynamicOffsetY;
+            int dynX = dotsPos.X - 130;
+            int dynY = dotsPos.Y + dynOffY;
+
+            // ── Step 1: Click "..." button ────────────────────────────────────────────
+            SimulatePhysicalClick(dotsPos.X, dotsPos.Y);
+            Thread.Sleep(120); // wait for dropdown
+
+            // ── Step 2: Direct Mouse Click on "Make dynamic" ──────────────────────────
+            SimulatePhysicalClick(dynX, dynY);
+            Thread.Sleep(60);
+
+            // ── Step 3: Restore cursor back to canvas ─────────────────────────────────
+            SetCursorPos(origPt.X, origPt.Y);
+
+            lblStatus.Text = string.Format("[ DYNAMIC ] Cuboid nahimong DYNAMIC na! (Key: {0})", FormatKeyName(cuboidSetupKey));
+            lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+            Beep(1600, 80);
+        }
+
+        private void ExecuteCuboidAction(int actionIndex)
+        {
+            if (actionIndex < 0 || actionIndex >= cuboidActions.Count) return;
+            CuboidActionSlot act = cuboidActions[actionIndex];
+
+            POINT origPt;
+            GetCursorPos(out origPt);
+
+            // For DELETE CUBOID: also send keyboard Delete key directly to active window
+            if (actionIndex == 3)
+            {
+                byte vkDel = (byte)Keys.Delete;
+                byte scanDel = (byte)MapVirtualKey(vkDel, 0);
+                keybd_event(vkDel, scanDel, 0, UIntPtr.Zero);
+                Thread.Sleep(15);
+                keybd_event(vkDel, scanDel, 2, UIntPtr.Zero);
+                Thread.Sleep(30);
+            }
+
+            if (dotsPos.X == 0 && dotsPos.Y == 0)
+            {
+                if (actionIndex == 3)
+                {
+                    lblStatus.Text = string.Format("[ ACTION: {0} ] Keyboard Delete sent! (Key: {1})",
+                        act.Name, FormatKeyName(act.Hotkey));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1400, 60);
+                    return;
+                }
+                lblStatus.Text = "[ WALA PA NA-SET ] Palihog i-set una ang posisyon sa \"...\" (3 Dots) button!";
+                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+                Beep(400, 100);
+                return;
+            }
+
+            int offY = act.OffsetY;
+            if (numCuboidActIndex != null && numCuboidActIndex[actionIndex] != null)
+                offY = (int)numCuboidActIndex[actionIndex].Value;
+
+            // Delete Cuboid (index 3) is shorter text and needs to click further left (-125px)
+            int offX = (actionIndex == 3) ? -125 : -95;
+            int targetX = dotsPos.X + offX;
+            int targetY = dotsPos.Y + offY;
+
+            // 1. Click "..." button to open the dropdown menu
+            SimulatePhysicalClick(dotsPos.X, dotsPos.Y);
+            Thread.Sleep(120);
+
+            // 2. Direct Mouse Click on the menu item!
+            SimulatePhysicalClick(targetX, targetY);
+            Thread.Sleep(60);
+
+            // For Delete Cuboid: also send Enter key in case a confirm modal ("Are you sure?") appears
+            if (actionIndex == 3)
+            {
+                byte vkEnter = (byte)Keys.Return;
+                byte scanEnter = (byte)MapVirtualKey(vkEnter, 0);
+                keybd_event(vkEnter, scanEnter, 0, UIntPtr.Zero);
+                Thread.Sleep(15);
+                keybd_event(vkEnter, scanEnter, 2, UIntPtr.Zero);
+            }
+
+            // 3. Restore cursor back to original canvas position
+            Thread.Sleep(60);
+            SetCursorPos(origPt.X, origPt.Y);
+
+            lblStatus.Text = string.Format("[ ACTION: {0} ] Na-click sa ({1}, {2})! (Key: {3})",
+                act.Name, targetX, targetY, FormatKeyName(act.Hotkey));
+            lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+            Beep(1400, 60);
+        }
+
+        private void ClickSinglePoint(Point pt)
+        {
+            if (pt.X == 0 && pt.Y == 0)
+            {
+                lblStatus.Text = "[ WALA PA NA-SET ] Posisyon wala pa ma-set!";
+                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+                Beep(400, 100);
+                return;
+            }
+
+            POINT origPt;
+            GetCursorPos(out origPt);
+
+            SetCursorPos(pt.X, pt.Y);
+            Thread.Sleep(15);
+            SendPhysicalClick(0, true);
+            Thread.Sleep(20);
+            SendPhysicalClick(0, false);
+
+            Thread.Sleep(20);
+            SetCursorPos(origPt.X, origPt.Y);
+
+            lblStatus.Text = string.Format("[ CLICKED ] Gi-click ang X:{0}, Y:{1}", pt.X, pt.Y);
+            lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+            Beep(1200, 50);
+        }
+
+        private void RefreshCuboidActUI(int i)
+        {
+            if (i < 0 || i >= cuboidActions.Count) return;
+            CuboidActionSlot act = cuboidActions[i];
+
+            if (btnCuboidActKey[i] != null)
+            {
+                if (listeningCuboidActionIndex == i)
+                {
+                    btnCuboidActKey[i].Text = "[ Pindota Key... ]";
+                    btnCuboidActKey[i].BackColor = Color.FromArgb(249, 226, 175);
+                    btnCuboidActKey[i].ForeColor = Color.FromArgb(24, 24, 37);
+                }
+                else
+                {
+                    btnCuboidActKey[i].Text = string.Format("Key: {0}", FormatKeyName(act.Hotkey));
+                    btnCuboidActKey[i].BackColor = Color.FromArgb(49, 50, 68);
+                    btnCuboidActKey[i].ForeColor = Color.White;
+                }
+            }
+        }
+
+        private void StartListeningCuboidSetupKey()
+        {
+            isListeningCuboidSetupKey = true;
+            btnCuboidSetupKey.Text = "[ Pindota Key... ]";
+            btnCuboidSetupKey.BackColor = Color.FromArgb(249, 226, 175);
+            btnCuboidSetupKey.ForeColor = Color.FromArgb(24, 24, 37);
+
+            lblStatus.Text = "[ CHANGE SETUP KEY ] Pindota ang key para sa Cuboid Setup (ESC para cancel)";
+            lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+
+            this.Focus();
+        }
+
+        private void StartListeningCuboidActionKey(int index)
+        {
+            listeningCuboidActionIndex = index;
+            btnCuboidActKey[index].Text = "[ Pindota Key... ]";
+            btnCuboidActKey[index].BackColor = Color.FromArgb(249, 226, 175);
+            btnCuboidActKey[index].ForeColor = Color.FromArgb(24, 24, 37);
+
+            lblStatus.Text = string.Format("[ CHANGE KEY ] Pindota ang key para sa \"{0}\" (ESC para cancel)", cuboidActions[index].Name);
+            lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+
+            this.Focus();
+        }
+        #endregion
+
+        #region Countdown Logic
+        private void StartCountdown(int targetType, int index)
+        {
+            if (countdownTimer.Enabled) countdownTimer.Stop();
+
+            countdownTargetType = targetType;
+            countdownTargetIndex = index;
+            countdownSeconds = 3;
+
+            string targetName = GetTargetName(targetType, index);
+            lblStatus.Text = string.Format("[ SETTING POS ] I-hover imong mouse sa \"{0}\" sulod sa 3 segundos! (3s)", targetName);
+            lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+            Beep(800, 80);
+
+            UpdateCountdownButtonText(string.Format("({0}s)...", countdownSeconds), true);
+            countdownTimer.Start();
+        }
+
+        private string GetTargetName(int targetType, int index)
+        {
+            if (targetType == 1 && index >= 0 && index < attrSlots.Count) return attrSlots[index].Name;
+            if (targetType == 2) return "\"...\" 3 Dots Menu Button";
+            return "Target";
+        }
+
+        private void UpdateCountdownButtonText(string txt, bool active)
+        {
+            Color bg = active ? Color.FromArgb(249, 226, 175) : Color.FromArgb(243, 139, 168);
+            Color fg = Color.FromArgb(24, 24, 37);
+
+            if (countdownTargetType == 1 && countdownTargetIndex >= 0 && countdownTargetIndex < 5)
+            {
+                btnSlotSet[countdownTargetIndex].Text = txt;
+                btnSlotSet[countdownTargetIndex].BackColor = bg;
+                btnSlotSet[countdownTargetIndex].ForeColor = fg;
+            }
+            else if (countdownTargetType == 2 && btnSetDots != null)
+            {
+                btnSetDots.Text = txt;
+                btnSetDots.BackColor = bg;
+                btnSetDots.ForeColor = fg;
+            }
+        }
+
+        private void CountdownTick(object sender, EventArgs e)
+        {
+            countdownSeconds--;
+            if (countdownSeconds > 0)
+            {
+                string targetName = GetTargetName(countdownTargetType, countdownTargetIndex);
+                lblStatus.Text = string.Format("[ SETTING POS ] I-hover imong mouse sa \"{0}\"! ({1}s)", targetName, countdownSeconds);
+                UpdateCountdownButtonText(string.Format("({0}s)...", countdownSeconds), true);
+                Beep(800, 80);
+            }
+            else
+            {
+                countdownTimer.Stop();
+                POINT pt;
+                if (GetCursorPos(out pt))
+                {
+                    IntPtr target = WindowFromPoint(pt);
+                    POINT clientPt = pt;
+                    if (target != IntPtr.Zero) ScreenToClient(target, ref clientPt);
+
+                    if (countdownTargetType == 1 && countdownTargetIndex >= 0 && countdownTargetIndex < attrSlots.Count)
+                    {
+                        AttributeSlot s = attrSlots[countdownTargetIndex];
+                        s.ScreenX = pt.X;
+                        s.ScreenY = pt.Y;
+                        s.TargetHwnd = target;
+                        s.ClientX = clientPt.X;
+                        s.ClientY = clientPt.Y;
+                        s.IsSet = true;
+                        RefreshSlotUI(countdownTargetIndex);
+                    }
+                    else if (countdownTargetType == 2)
+                    {
+                        dotsPos = new Point(pt.X, pt.Y);
+                        if (lblDotsPos != null) lblDotsPos.Text = FormatPoint(dotsPos);
+                    }
+
+                    Beep(1600, 200);
+                    string targetName = GetTargetName(countdownTargetType, countdownTargetIndex);
+                    lblStatus.Text = string.Format("[ NA-CAPTURE NA! ] Posisyon sa \"{0}\" na-set sa X:{1}, Y:{2}", targetName, pt.X, pt.Y);
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+
+                    UpdateCountdownButtonText("Set Pos (3s)", false);
+                    SaveAttributesConfig();
+                }
+
+                countdownTargetType = 0;
+                countdownTargetIndex = -1;
+            }
+        }
+        #endregion
+
+        #region Key Process & Hotkeys
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+
+            if (isListeningNextKey)
+            {
+                isListeningNextKey = false;
+                if (k != Keys.Escape)
+                {
+                    nextFrameKey = k;
+                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                    lblStatus.Text = string.Format("[ NEXT KEY ] Next Frame key na-set sa [{0}]!", FormatKeyName(nextFrameKey));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1200, 100);
+                    SaveAttributesConfig();
+                }
+                else
+                {
+                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
+                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang Next Key.";
+                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                }
+                btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
+                btnNextKey.ForeColor = Color.White;
+                return true;
+            }
+
+            if (listeningSlotIndex != -1)
+            {
+                int idx = listeningSlotIndex;
+                listeningSlotIndex = -1;
+                if (k != Keys.Escape)
+                {
+                    attrSlots[idx].Hotkey = k;
+                    lblStatus.Text = string.Format("[ KEY NA-ILISAN ] Ang \"{0}\" gigapos na sa key [{1}]!",
+                        attrSlots[idx].Name, FormatKeyName(k));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1200, 100);
+                    if (attributesEnabled) RegisterAttributeHotkeys();
+                    SaveAttributesConfig();
+                }
+                else
+                {
+                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang key.";
+                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                }
+                RefreshSlotUI(idx);
+                return true;
+            }
+
+            if (isListeningCuboidSetupKey)
+            {
+                isListeningCuboidSetupKey = false;
+                if (k != Keys.Escape)
+                {
+                    cuboidSetupKey = k;
+                    btnCuboidSetupKey.Text = string.Format("Key: {0}", FormatKeyName(cuboidSetupKey));
+                    lblStatus.Text = string.Format("[ SETUP KEY ] Setup key na-set sa [{0}]!", FormatKeyName(cuboidSetupKey));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1200, 100);
+                    if (cuboidActionsEnabled) RegisterCuboidHotkeys();
+                    SaveAttributesConfig();
+                }
+                else
+                {
+                    btnCuboidSetupKey.Text = string.Format("Key: {0}", FormatKeyName(cuboidSetupKey));
+                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang Setup Key.";
+                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                }
+                btnCuboidSetupKey.BackColor = Color.FromArgb(49, 50, 68);
+                btnCuboidSetupKey.ForeColor = Color.White;
+                return true;
+            }
+
+            if (listeningCuboidActionIndex != -1)
+            {
+                int idx = listeningCuboidActionIndex;
+                listeningCuboidActionIndex = -1;
+                if (k != Keys.Escape)
+                {
+                    cuboidActions[idx].Hotkey = k;
+                    lblStatus.Text = string.Format("[ ACTION KEY ] Ang \"{0}\" gigapos na sa key [{1}]!",
+                        cuboidActions[idx].Name, FormatKeyName(k));
+                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                    Beep(1200, 100);
+                    if (cuboidActionsEnabled) RegisterCuboidHotkeys();
+                    SaveAttributesConfig();
+                }
+                else
+                {
+                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang action key.";
+                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
+                }
+                RefreshCuboidActUI(idx);
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private void RegisterHotkeys()
+        {
+            RegisterHotKey(this.Handle, HOTKEY_RECORD, 0, (uint)Keys.F8);
+            RegisterHotKey(this.Handle, HOTKEY_PLAY, 0, (uint)Keys.F6);
+            RegisterHotKey(this.Handle, HOTKEY_CLEAR, 0, (uint)Keys.F9);
+            RegisterHotKey(this.Handle, HOTKEY_TOGGLE_ATTR, 0, (uint)Keys.F7);
+            RegisterHotKey(this.Handle, HOTKEY_TOGGLE_CUBOID, 0, (uint)Keys.F4);
+
+            if (attributesEnabled) RegisterAttributeHotkeys();
+            if (cuboidActionsEnabled) RegisterCuboidHotkeys();
+        }
+
+        private void UnregisterHotkeys()
+        {
+            UnregisterHotKey(this.Handle, HOTKEY_RECORD);
+            UnregisterHotKey(this.Handle, HOTKEY_PLAY);
+            UnregisterHotKey(this.Handle, HOTKEY_CLEAR);
+            UnregisterHotKey(this.Handle, HOTKEY_TOGGLE_ATTR);
+            UnregisterHotKey(this.Handle, HOTKEY_TOGGLE_CUBOID);
+
+            UnregisterAttributeHotkeys();
+            UnregisterCuboidHotkeys();
+        }
+
+        private void RegisterAttributeHotkeys()
+        {
+            UnregisterAttributeHotkeys();
+            if (!attributesEnabled) return;
+
+            for (int i = 0; i < attrSlots.Count; i++)
+            {
+                if (attrSlots[i].Hotkey != Keys.None)
+                {
+                    RegisterHotKey(this.Handle, HOTKEY_ATTR_BASE + i, 0, (uint)attrSlots[i].Hotkey);
+                }
+            }
+        }
+
+        private void UnregisterAttributeHotkeys()
+        {
+            for (int i = 0; i < attrSlots.Count; i++)
+            {
+                UnregisterHotKey(this.Handle, HOTKEY_ATTR_BASE + i);
+            }
+        }
+
+        private void RegisterCuboidHotkeys()
+        {
+            UnregisterCuboidHotkeys();
+            if (!cuboidActionsEnabled) return;
+
+            if (cuboidSetupKey != Keys.None)
+            {
+                RegisterHotKey(this.Handle, HOTKEY_CUBOID_SETUP, 0, (uint)cuboidSetupKey);
+            }
+
+            for (int i = 0; i < cuboidActions.Count; i++)
+            {
+                if (cuboidActions[i].Hotkey != Keys.None)
+                {
+                    RegisterHotKey(this.Handle, HOTKEY_CUBOID_BASE + i, 0, (uint)cuboidActions[i].Hotkey);
+                }
+            }
+        }
+
+        private void UnregisterCuboidHotkeys()
+        {
+            UnregisterHotKey(this.Handle, HOTKEY_CUBOID_SETUP);
+            for (int i = 0; i < cuboidActions.Count; i++)
+            {
+                UnregisterHotKey(this.Handle, HOTKEY_CUBOID_BASE + i);
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY)
+            {
+                int id = m.WParam.ToInt32();
+                if (id == HOTKEY_RECORD) ToggleRecording();
+                else if (id == HOTKEY_PLAY) TogglePlayback();
+                else if (id == HOTKEY_CLEAR) ClearAll();
+                else if (id == HOTKEY_TOGGLE_ATTR) ToggleAttributesMaster();
+                else if (id == HOTKEY_TOGGLE_CUBOID) ToggleCuboidMaster();
+                else if (id == HOTKEY_CUBOID_SETUP) ExecuteMakeDynamicAndDensity();
+                else if (id >= HOTKEY_ATTR_BASE && id < HOTKEY_ATTR_BASE + attrSlots.Count)
+                {
+                    TriggerSlotClick(id - HOTKEY_ATTR_BASE);
+                }
+                else if (id >= HOTKEY_CUBOID_BASE && id < HOTKEY_CUBOID_BASE + cuboidActions.Count)
+                {
+                    ExecuteCuboidAction(id - HOTKEY_CUBOID_BASE);
+                }
+            }
+            base.WndProc(ref m);
+        }
+        #endregion
+
+        #region Tab 2: Attributes Logic
         private void ToggleAttributesMaster()
         {
             attributesEnabled = !attributesEnabled;
@@ -785,29 +1510,6 @@ namespace BackgroundAutoClicker
 
         private void StartListeningKey(int slotIndex)
         {
-            if (listeningSlotIndex == slotIndex)
-            {
-                listeningSlotIndex = -1;
-                RefreshSlotUI(slotIndex);
-                lblStatus.Text = "[ READY ] Kanselado ang pag-ilis sa key.";
-                lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
-                return;
-            }
-
-            if (listeningSlotIndex != -1)
-            {
-                int prev = listeningSlotIndex;
-                listeningSlotIndex = -1;
-                RefreshSlotUI(prev);
-            }
-            if (isListeningNextKey)
-            {
-                isListeningNextKey = false;
-                btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
-                btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
-                btnNextKey.ForeColor = Color.White;
-            }
-
             listeningSlotIndex = slotIndex;
             btnSlotKey[slotIndex].Text = "[ Pindota Key... ]";
             btnSlotKey[slotIndex].BackColor = Color.FromArgb(249, 226, 175);
@@ -821,24 +1523,6 @@ namespace BackgroundAutoClicker
 
         private void StartListeningNextKey()
         {
-            if (isListeningNextKey)
-            {
-                isListeningNextKey = false;
-                btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
-                btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
-                btnNextKey.ForeColor = Color.White;
-                lblStatus.Text = "[ READY ] Kanselado ang pag-ilis sa Next key.";
-                lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
-                return;
-            }
-
-            if (listeningSlotIndex != -1)
-            {
-                int prev = listeningSlotIndex;
-                listeningSlotIndex = -1;
-                RefreshSlotUI(prev);
-            }
-
             isListeningNextKey = true;
             btnNextKey.Text = "[ Pindota Key... ]";
             btnNextKey.BackColor = Color.FromArgb(249, 226, 175);
@@ -848,137 +1532,6 @@ namespace BackgroundAutoClicker
             lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
 
             this.Focus();
-        }
-
-        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
-        {
-            if (isListeningNextKey)
-            {
-                Keys k = keyData & Keys.KeyCode;
-                isListeningNextKey = false;
-
-                if (k != Keys.Escape)
-                {
-                    nextFrameKey = k;
-                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
-                    btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
-                    btnNextKey.ForeColor = Color.White;
-
-                    lblStatus.Text = string.Format("[ NEXT KEY NA-ILISAN ] Next Frame key na-set sa [{0}]!", FormatKeyName(nextFrameKey));
-                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
-                    Beep(1200, 100);
-
-                    SaveAttributesConfig();
-                }
-                else
-                {
-                    btnNextKey.Text = string.Format("Next Key: {0}", FormatKeyName(nextFrameKey));
-                    btnNextKey.BackColor = Color.FromArgb(49, 50, 68);
-                    btnNextKey.ForeColor = Color.White;
-                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang Next Key.";
-                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
-                }
-
-                return true;
-            }
-
-            if (listeningSlotIndex != -1)
-            {
-                Keys k = keyData & Keys.KeyCode;
-                int idx = listeningSlotIndex;
-                listeningSlotIndex = -1;
-
-                if (k != Keys.Escape)
-                {
-                    attrSlots[idx].Hotkey = k;
-                    lblStatus.Text = string.Format("[ KEY NA-ILISAN ] Ang \"{0}\" gigapos na sa key [{1}]!",
-                        attrSlots[idx].Name, FormatKeyName(k));
-                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
-                    Beep(1200, 100);
-
-                    if (attributesEnabled)
-                    {
-                        RegisterAttributeHotkeys();
-                    }
-                    SaveAttributesConfig();
-                }
-                else
-                {
-                    lblStatus.Text = "[ CANCELLED ] Wala gi-ilisan ang key.";
-                    lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
-                }
-
-                RefreshSlotUI(idx);
-                return true;
-            }
-
-            return base.ProcessCmdKey(ref msg, keyData);
-        }
-
-        private void StartCountdown(int slotIndex)
-        {
-            if (countdownTimer.Enabled)
-            {
-                countdownTimer.Stop();
-                if (countdownSlotIndex >= 0 && countdownSlotIndex < attrSlots.Count)
-                    RefreshSlotUI(countdownSlotIndex);
-            }
-
-            countdownSlotIndex = slotIndex;
-            countdownSeconds = 3;
-            lblStatus.Text = string.Format("[ SETTING POS ] I-hover imong mouse sa \"{0}\" sulod sa 3 segundos! (3s)", attrSlots[slotIndex].Name);
-            lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
-            Beep(800, 80);
-
-            btnSlotSet[slotIndex].Text = "(3s)...";
-            btnSlotSet[slotIndex].BackColor = Color.FromArgb(249, 226, 175);
-            btnSlotSet[slotIndex].ForeColor = Color.FromArgb(24, 24, 37);
-
-            countdownTimer.Start();
-        }
-
-        private void CountdownTick(object sender, EventArgs e)
-        {
-            countdownSeconds--;
-            if (countdownSeconds > 0)
-            {
-                lblStatus.Text = string.Format("[ SETTING POS ] I-hover imong mouse sa \"{0}\"! ({1}s)",
-                    attrSlots[countdownSlotIndex].Name, countdownSeconds);
-                btnSlotSet[countdownSlotIndex].Text = string.Format("({0}s)...", countdownSeconds);
-                Beep(800, 80);
-            }
-            else
-            {
-                countdownTimer.Stop();
-                POINT pt;
-                if (GetCursorPos(out pt))
-                {
-                    IntPtr target = WindowFromPoint(pt);
-                    POINT clientPt = pt;
-                    if (target != IntPtr.Zero)
-                    {
-                        ScreenToClient(target, ref clientPt);
-                    }
-
-                    AttributeSlot s = attrSlots[countdownSlotIndex];
-                    s.ScreenX = pt.X;
-                    s.ScreenY = pt.Y;
-                    s.TargetHwnd = target;
-                    s.ClientX = clientPt.X;
-                    s.ClientY = clientPt.Y;
-                    s.IsSet = true;
-
-                    Beep(1600, 200);
-
-                    lblStatus.Text = string.Format("[ NA-CAPTURE NA! ] Posisyon sa \"{0}\" na-set sa X:{1}, Y:{2}",
-                        s.Name, s.ScreenX, s.ScreenY);
-                    lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
-
-                    RefreshSlotUI(countdownSlotIndex);
-                    SaveAttributesConfig();
-                }
-                countdownSlotIndex = -1;
-            }
         }
 
         private void TriggerSlotClick(int index)
@@ -994,10 +1547,8 @@ namespace BackgroundAutoClicker
                 return;
             }
 
-            // 1. Perform click on attribute
             if (rbAttrPostMessage != null && rbAttrPostMessage.Checked)
             {
-                // Background Click via PostMessage
                 IntPtr target = slot.TargetHwnd;
                 if (!IsWindow(target))
                 {
@@ -1019,14 +1570,13 @@ namespace BackgroundAutoClicker
             }
             else
             {
-                // Physical Jump & Click (Auto-restore)
                 POINT origPt;
                 GetCursorPos(out origPt);
 
                 SetCursorPos(slot.ScreenX, slot.ScreenY);
-                Thread.Sleep(10);
-                SendPhysicalClick(0, true);
                 Thread.Sleep(15);
+                SendPhysicalClick(0, true);
+                Thread.Sleep(20);
                 SendPhysicalClick(0, false);
 
                 if (chkRestoreCursor != null && chkRestoreCursor.Checked)
@@ -1038,7 +1588,6 @@ namespace BackgroundAutoClicker
 
             Beep(1300, 50);
 
-            // 2. Auto-Next Frame if enabled!
             if (chkAutoNextFrame != null && chkAutoNextFrame.Checked)
             {
                 int delay = numNextDelay != null ? (int)numNextDelay.Value : 100;
@@ -1063,10 +1612,8 @@ namespace BackgroundAutoClicker
             byte vk = (byte)nextFrameKey;
             byte scan = (byte)MapVirtualKey((uint)vk, 0);
 
-            // Send hardware key down with scan code (NO Shift - exact single keypress)
             keybd_event(vk, scan, 0, UIntPtr.Zero);
             Thread.Sleep(30);
-            // Send hardware key up with scan code
             keybd_event(vk, scan, 2, UIntPtr.Zero);
         }
 
@@ -1109,38 +1656,21 @@ namespace BackgroundAutoClicker
                 }
             }
 
-            if (btnSlotSet[i] != null)
-            {
-                if (countdownSlotIndex == i && countdownSeconds > 0)
-                {
-                    btnSlotSet[i].Text = string.Format("({0}s)...", countdownSeconds);
-                    btnSlotSet[i].BackColor = Color.FromArgb(249, 226, 175);
-                    btnSlotSet[i].ForeColor = Color.FromArgb(24, 24, 37);
-                }
-                else
-                {
-                    btnSlotSet[i].Text = "Set Pos (3s)";
-                    btnSlotSet[i].BackColor = Color.FromArgb(243, 139, 168);
-                    btnSlotSet[i].ForeColor = Color.FromArgb(24, 24, 37);
-                }
-            }
-
             if (lblSlotPos[i] != null)
             {
-                if (s.IsSet)
-                {
-                    lblSlotPos[i].Text = string.Format("X: {0}, Y: {1}", s.ScreenX, s.ScreenY);
-                    lblSlotPos[i].ForeColor = Color.FromArgb(166, 227, 161);
-                }
-                else
-                {
-                    lblSlotPos[i].Text = "[ Wala pa na-set ]";
-                    lblSlotPos[i].ForeColor = Color.FromArgb(108, 112, 134);
-                }
+                lblSlotPos[i].Text = s.IsSet ? string.Format("X: {0}, Y: {1}", s.ScreenX, s.ScreenY) : "[ Wala pa na-set ]";
+                lblSlotPos[i].ForeColor = s.IsSet ? Color.FromArgb(166, 227, 161) : Color.FromArgb(108, 112, 134);
             }
 
             if (btnSlotTest[i] != null) btnSlotTest[i].Enabled = s.IsSet;
             if (btnSlotClear[i] != null) btnSlotClear[i].Enabled = s.IsSet;
+        }
+        #endregion
+
+        #region Helpers & Config
+        private string FormatPoint(Point pt)
+        {
+            return (pt.X == 0 && pt.Y == 0) ? "[ Wala pa na-set ]" : string.Format("X: {0}, Y: {1}", pt.X, pt.Y);
         }
 
         private string FormatKeyName(Keys k)
@@ -1192,6 +1722,20 @@ namespace BackgroundAutoClicker
                     AttributeSlot s = attrSlots[i];
                     lines.Add(string.Format("Slot{0}={1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}",
                         i, s.Name, (int)s.Hotkey, s.ScreenX, s.ScreenY, s.TargetHwnd.ToInt64(), s.ClientX, s.ClientY, s.IsSet));
+                }
+
+                lines.Add("CuboidEnabled=" + cuboidActionsEnabled.ToString());
+                lines.Add(string.Format("DotsPos={0}|{1}", dotsPos.X, dotsPos.Y));
+                lines.Add("CuboidSetupKey=" + ((int)cuboidSetupKey).ToString());
+                int dynMenuIdx = (numMakeDynamicIdx != null) ? (int)numMakeDynamicIdx.Value : makeDynamicOffsetY;
+                lines.Add("MakeDynamicOffsetY=" + dynMenuIdx.ToString());
+
+                for (int i = 0; i < cuboidActions.Count; i++)
+                {
+                    CuboidActionSlot act = cuboidActions[i];
+                    int savedIdx = (numCuboidActIndex[i] != null) ? (int)numCuboidActIndex[i].Value : act.OffsetY;
+                    lines.Add(string.Format("CuboidAct{0}={1}|{2}|{3}",
+                        i, act.Name, (int)act.Hotkey, savedIdx));
                 }
 
                 File.WriteAllLines(configPath, lines.ToArray());
@@ -1273,13 +1817,51 @@ namespace BackgroundAutoClicker
                             }
                         }
                     }
+                    else if (key == "CuboidEnabled")
+                    {
+                        bool ce;
+                        if (bool.TryParse(val, out ce)) cuboidActionsEnabled = ce;
+                    }
+                    else if (key == "DotsPos")
+                    {
+                        string[] p = val.Split('|');
+                        if (p.Length >= 2)
+                        {
+                            int x, y;
+                            if (int.TryParse(p[0], out x) && int.TryParse(p[1], out y)) dotsPos = new Point(x, y);
+                        }
+                    }
+                    else if (key == "CuboidSetupKey")
+                    {
+                        int sk;
+                        if (int.TryParse(val, out sk)) cuboidSetupKey = (Keys)sk;
+                    }
+                    else if (key == "MakeDynamicIdx" || key == "MakeDynamicOffsetY")
+                    {
+                        int mi;
+                        if (int.TryParse(val, out mi) && mi >= 40 && mi <= 500) makeDynamicOffsetY = mi;
+                    }
+                    else if (key.StartsWith("CuboidAct"))
+                    {
+                        int actIdx;
+                        if (int.TryParse(key.Substring(9), out actIdx) && actIdx >= 0 && actIdx < cuboidActions.Count)
+                        {
+                            string[] p = val.Split('|');
+                            if (p.Length >= 3)
+                            {
+                                cuboidActions[actIdx].Name = p[0];
+                                int kInt;
+                                if (int.TryParse(p[1], out kInt)) cuboidActions[actIdx].Hotkey = (Keys)kInt;
+                                int mIdx;
+                                if (int.TryParse(p[2], out mIdx) && mIdx >= 40 && mIdx <= 500) cuboidActions[actIdx].OffsetY = mIdx;
+                            }
+                        }
+                    }
                 }
             }
             catch { }
         }
-        #endregion
 
-        #region UI Helpers
         private Label MakeLabel(Control parent, string text, int x, int y, Font f, Color c)
         {
             Label lb = new Label();
@@ -1292,6 +1874,29 @@ namespace BackgroundAutoClicker
             return lb;
         }
 
+        private Image LoadBackgroundImage()
+        {
+            try
+            {
+                string bgPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bg.jpg");
+                if (File.Exists(bgPath))
+                {
+                    using (FileStream fs = new FileStream(bgPath, FileMode.Open, FileAccess.Read))
+                    {
+                        return Image.FromStream(fs);
+                    }
+                }
+
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = asm.GetManifestResourceStream("bg.jpg"))
+                {
+                    if (stream != null) return Image.FromStream(stream);
+                }
+            }
+            catch { }
+            return null;
+        }
+
         private GroupBox MakeGroup(string t, int x, int y, int w, int h)
         {
             GroupBox g = new GroupBox();
@@ -1299,7 +1904,7 @@ namespace BackgroundAutoClicker
             g.Location = new Point(x, y);
             g.Size = new Size(w, h);
             g.ForeColor = Color.FromArgb(186, 194, 222);
-            g.BackColor = Color.FromArgb(30, 30, 46);
+            g.BackColor = Color.Transparent;
             return g;
         }
 
@@ -1324,6 +1929,8 @@ namespace BackgroundAutoClicker
             n.Size = new Size(w, 24);
             n.Minimum = min;
             n.Maximum = max;
+            if (val < min) val = min;
+            if (val > max) val = max;
             n.Value = val;
             n.Increment = inc;
             n.BackColor = Color.FromArgb(49, 50, 68);
@@ -1333,70 +1940,7 @@ namespace BackgroundAutoClicker
         }
         #endregion
 
-        #region Hotkeys
-        private void RegisterHotkeys()
-        {
-            RegisterHotKey(this.Handle, HOTKEY_RECORD, 0, (uint)Keys.F8);
-            RegisterHotKey(this.Handle, HOTKEY_PLAY, 0, (uint)Keys.F6);
-            RegisterHotKey(this.Handle, HOTKEY_CLEAR, 0, (uint)Keys.F9);
-            RegisterHotKey(this.Handle, HOTKEY_TOGGLE_ATTR, 0, (uint)Keys.F7);
-
-            if (attributesEnabled)
-            {
-                RegisterAttributeHotkeys();
-            }
-        }
-
-        private void UnregisterHotkeys()
-        {
-            UnregisterHotKey(this.Handle, HOTKEY_RECORD);
-            UnregisterHotKey(this.Handle, HOTKEY_PLAY);
-            UnregisterHotKey(this.Handle, HOTKEY_CLEAR);
-            UnregisterHotKey(this.Handle, HOTKEY_TOGGLE_ATTR);
-            UnregisterAttributeHotkeys();
-        }
-
-        private void RegisterAttributeHotkeys()
-        {
-            UnregisterAttributeHotkeys();
-            if (!attributesEnabled) return;
-
-            for (int i = 0; i < attrSlots.Count; i++)
-            {
-                if (attrSlots[i].Hotkey != Keys.None)
-                {
-                    RegisterHotKey(this.Handle, HOTKEY_ATTR_BASE + i, 0, (uint)attrSlots[i].Hotkey);
-                }
-            }
-        }
-
-        private void UnregisterAttributeHotkeys()
-        {
-            for (int i = 0; i < attrSlots.Count; i++)
-            {
-                UnregisterHotKey(this.Handle, HOTKEY_ATTR_BASE + i);
-            }
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_HOTKEY)
-            {
-                int id = m.WParam.ToInt32();
-                if (id == HOTKEY_RECORD) ToggleRecording();
-                else if (id == HOTKEY_PLAY) TogglePlayback();
-                else if (id == HOTKEY_CLEAR) ClearAll();
-                else if (id == HOTKEY_TOGGLE_ATTR) ToggleAttributesMaster();
-                else if (id >= HOTKEY_ATTR_BASE && id < HOTKEY_ATTR_BASE + attrSlots.Count)
-                {
-                    TriggerSlotClick(id - HOTKEY_ATTR_BASE);
-                }
-            }
-            base.WndProc(ref m);
-        }
-        #endregion
-
-        #region Hover Recording
+        #region Hover Recording & Playback
         private void ToggleRecording()
         {
             if (isPlaying) { isPlaying = false; Thread.Sleep(100); }
@@ -1439,10 +1983,7 @@ namespace BackgroundAutoClicker
                 {
                     IntPtr target = WindowFromPoint(pt);
                     POINT clientPt = pt;
-                    if (target != IntPtr.Zero)
-                    {
-                        ScreenToClient(target, ref clientPt);
-                    }
+                    if (target != IntPtr.Zero) ScreenToClient(target, ref clientPt);
 
                     RecordedFrame f = new RecordedFrame();
                     f.ScreenX = pt.X;
@@ -1481,7 +2022,7 @@ namespace BackgroundAutoClicker
                     }
                 }
 
-                Thread.Sleep(25); // ~40 fps
+                Thread.Sleep(25);
             }
         }
 
@@ -1525,29 +2066,20 @@ namespace BackgroundAutoClicker
                 lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
             }
         }
-        #endregion
 
-        #region Hover Playback
         private void TogglePlayback()
         {
             if (isRecording) StopRecording();
 
-            if (isPlaying)
-                StopPlayback();
-            else
-                StartPlayback();
+            if (isPlaying) StopPlayback();
+            else StartPlayback();
         }
 
         private void StartPlayback()
         {
             if (frames.Count == 0)
             {
-                MessageBox.Show(
-                    "Wala pay na-record!\n\n" +
-                    "1. Pindota F8 para mag-start og record.\n" +
-                    "2. Lihoka imong mouse sa target window.\n" +
-                    "3. Pindota F8 balik para mahuman.\n" +
-                    "4. Pindota F6 para i-play!",
+                MessageBox.Show("Wala pay na-record!\n\n1. F8 start record\n2. Lihok mouse\n3. F8 stop\n4. F6 play!",
                     "No Recording", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1562,12 +2094,12 @@ namespace BackgroundAutoClicker
             bool isBg = rbBackgroundMode.Checked;
             if (isBg)
             {
-                lblStatus.Text = "[ PLAYING BACKGROUND ]  Dili mo-lihok imong mouse! Pwede ka mag-Alt+Tab freely. F6 para hunong.";
+                lblStatus.Text = "[ PLAYING BACKGROUND ]  Dili mo-lihok imong mouse! Pwede Alt+Tab. F6 para hunong.";
                 lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
             }
             else
             {
-                lblStatus.Text = "[ PLAYING CURSOR ]  Mouse is auto-moving in loop! F6 o ESC para hunong.";
+                lblStatus.Text = "[ PLAYING CURSOR ]  Mouse is auto-moving! F6 o ESC para hunong.";
                 lblStatus.ForeColor = Color.FromArgb(249, 226, 175);
             }
 
@@ -1634,19 +2166,13 @@ namespace BackgroundAutoClicker
                                 PostMessage(target, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, lParam);
                                 Interlocked.Increment(ref totalClicks);
                             }
-                            if (f.IsLeftRelease)
-                            {
-                                PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, lParam);
-                            }
+                            if (f.IsLeftRelease) PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, lParam);
                             if (f.IsRightClick)
                             {
                                 PostMessage(target, WM_RBUTTONDOWN, (IntPtr)MK_RBUTTON, lParam);
                                 Interlocked.Increment(ref totalClicks);
                             }
-                            if (f.IsRightRelease)
-                            {
-                                PostMessage(target, WM_RBUTTONUP, IntPtr.Zero, lParam);
-                            }
+                            if (f.IsRightRelease) PostMessage(target, WM_RBUTTONUP, IntPtr.Zero, lParam);
 
                             if (autoClick && (frameCounter % clickEvery == 0))
                             {
@@ -1683,16 +2209,12 @@ namespace BackgroundAutoClicker
                     {
                         long delta = frames[i + 1].TimestampMs - f.TimestampMs;
                         int sleepMs = (int)(delta / speedFactor);
-                        if (sleepMs > 0 && sleepMs < 10000)
-                            Thread.Sleep(sleepMs);
+                        if (sleepMs > 0 && sleepMs < 10000) Thread.Sleep(sleepMs);
                     }
                 }
 
-                if (!loopForever && loopsDone >= maxLoops)
-                    break;
-
-                if (isPlaying && loopDelayMs > 0)
-                    Thread.Sleep(loopDelayMs);
+                if (!loopForever && loopsDone >= maxLoops) break;
+                if (isPlaying && loopDelayMs > 0) Thread.Sleep(loopDelayMs);
             }
 
             if (this.IsHandleCreated)
