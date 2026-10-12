@@ -111,6 +111,12 @@ namespace BackgroundAutoClicker
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
         [DllImport("user32.dll")]
+        public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -207,7 +213,7 @@ namespace BackgroundAutoClicker
         // Auto-Next Frame settings
         private bool autoNextFrame = true;
         private Keys nextFrameKey = Keys.Oemplus; // '+' key
-        private int nextFrameDelay = 60; // ms
+        private int nextFrameDelay = 100; // ms
         private bool isListeningNextKey = false;
 
         private System.Windows.Forms.Timer countdownTimer;
@@ -630,6 +636,13 @@ namespace BackgroundAutoClicker
             btnTestNext.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             btnTestNext.Click += delegate
             {
+                IntPtr tgt = recordedMainHwnd;
+                if (tgt == IntPtr.Zero && attrSlots.Count > 0 && attrSlots[0].IsSet) tgt = attrSlots[0].TargetHwnd;
+                if (tgt != IntPtr.Zero && IsWindow(tgt))
+                {
+                    SetForegroundWindow(tgt);
+                    Thread.Sleep(80);
+                }
                 SendNextFrameKey();
                 lblStatus.Text = string.Format("[ TEST NEXT ] Gi-padala ang key [{0}] para sa next frame!", FormatKeyName(nextFrameKey));
                 lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
@@ -1028,7 +1041,7 @@ namespace BackgroundAutoClicker
             // 2. Auto-Next Frame if enabled!
             if (chkAutoNextFrame != null && chkAutoNextFrame.Checked)
             {
-                int delay = numNextDelay != null ? (int)numNextDelay.Value : 60;
+                int delay = numNextDelay != null ? (int)numNextDelay.Value : 100;
                 if (delay > 0) Thread.Sleep(delay);
 
                 SendNextFrameKey();
@@ -1047,34 +1060,14 @@ namespace BackgroundAutoClicker
 
         private void SendNextFrameKey()
         {
-            if (nextFrameKey == Keys.Oemplus)
-            {
-                // US layout: '+' is Shift + '='
-                keybd_event(0x10, 0, 0, UIntPtr.Zero); // Shift down
-                keybd_event(0xBB, 0, 0, UIntPtr.Zero); // '=' down
-                Thread.Sleep(10);
-                keybd_event(0xBB, 0, 2, UIntPtr.Zero); // '=' up
-                keybd_event(0x10, 0, 2, UIntPtr.Zero); // Shift up
+            byte vk = (byte)nextFrameKey;
+            byte scan = (byte)MapVirtualKey((uint)vk, 0);
 
-                // Also trigger VK_ADD (NumPad +) just in case web app listens for keyCode 107
-                keybd_event(0x6B, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(5);
-                keybd_event(0x6B, 0, 2, UIntPtr.Zero);
-            }
-            else if (nextFrameKey == Keys.Add)
-            {
-                // NumPad +
-                keybd_event(0x6B, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(10);
-                keybd_event(0x6B, 0, 2, UIntPtr.Zero);
-            }
-            else
-            {
-                byte vk = (byte)nextFrameKey;
-                keybd_event(vk, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(10);
-                keybd_event(vk, 0, 2, UIntPtr.Zero);
-            }
+            // Send hardware key down with scan code (NO Shift - exact single keypress)
+            keybd_event(vk, scan, 0, UIntPtr.Zero);
+            Thread.Sleep(30);
+            // Send hardware key up with scan code
+            keybd_event(vk, scan, 2, UIntPtr.Zero);
         }
 
         private void ClearSlot(int index)
