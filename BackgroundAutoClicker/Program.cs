@@ -438,6 +438,12 @@ namespace BackgroundAutoClicker
                 this.BackgroundImageLayout = ImageLayout.Stretch;
             }
 
+            Icon appIcon = LoadAppIcon();
+            if (appIcon != null)
+            {
+                this.Icon = appIcon;
+            }
+
             // Panels for Tabs
             pnlHoverTab = new Panel();
             pnlHoverTab.Location = new Point(20, 168);
@@ -1891,6 +1897,26 @@ namespace BackgroundAutoClicker
                 using (var stream = asm.GetManifestResourceStream("bg.jpg"))
                 {
                     if (stream != null) return Image.FromStream(stream);
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private Icon LoadAppIcon()
+        {
+            try
+            {
+                string icoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app.ico");
+                if (File.Exists(icoPath))
+                {
+                    return new Icon(icoPath);
+                }
+
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = asm.GetManifestResourceStream("app.ico"))
+                {
+                    if (stream != null) return new Icon(stream);
                 }
             }
             catch { }
